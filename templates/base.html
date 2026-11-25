@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}借展箱交运验封核查{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a class="brand" href="{{ url_for('index') }}">
+        <span class="brand-mark">封</span>
+        <span>
+          <strong>借展箱交运验封核查</strong>
+          <small>库房 × 质检流水合并判定</small>
+        </span>
+      </a>
+      <nav>
+        <a href="{{ url_for('index') }}">上传核查</a>
+        <a href="{{ url_for('index') }}#rules">判定规则</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container main">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      Flask + SQLite · Docker Compose 可启动 · 结论基于偏序可行排列，不穷举同分钟排法
+    </div>
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

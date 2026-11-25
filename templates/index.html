@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}上传核查 · 借展箱验封{% endblock %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">MINUTE-LEVEL LEDGER CHECK</p>
+  <h1>交运前，验封是否有效？</h1>
+  <p class="lead">
+    上传同一只借展箱的<strong>库房流水</strong>与<strong>质检流水</strong>。系统会合并分钟、
+    同表行序和跨表补记，判断交运必然合格、必然不合格，还是两种顺序都有可能。
+  </p>
+</section>
+
+{% if error %}
+<div class="alert alert-error" role="alert" data-testid="upload-error">
+  <strong>无法完成核查：</strong>{{ error }}
+</div>
+{% endif %}
+
+<div class="layout-grid">
+  <section class="card upload-card">
+    <div class="card-head">
+      <h2>上传两份 CSV</h2>
+      <span class="pill">记录号 · 分钟时间 · 动作</span>
+    </div>
+
+    <form id="upload-form" action="{{ url_for('create_case_html') }}" method="post" enctype="multipart/form-data" class="form">
+      <div class="field">
+        <label for="box_code">箱号 / 案例名称（可选）</label>
+        <input id="box_code" name="box_code" type="text" placeholder="例如 EXH-BOX-017" maxlength="80">
+      </div>
+
+      <div class="field">
+        <label for="warehouse_file">
+          <span class="table-badge warehouse">库房</span> CSV：换签、一笔交运
+        </label>
+        <input id="warehouse_file" name="warehouse_file" type="file" accept=".csv,text/csv" required data-testid="warehouse-input">
+        <small>动作支持：<code>换签</code>、<code>交运</code></small>
+      </div>
+
+      <div class="field">
+        <label for="qc_file">
+          <span class="table-badge qc">质检</span> CSV：验封通过 / 验封失败
+        </label>
+        <input id="qc_file" name="qc_file" type="file" accept=".csv,text/csv" required data-testid="qc-input">
+        <small>动作支持：<code>验封通过</code>、<code>验封失败</code></small>
+      </div>
+
+      <button class="btn btn-primary btn-large" type="submit">上传并核查</button>
+    </form>
+  </section>
+
+  <section class="card rules-card" id="rules">
+    <h2>判定规则</h2>
+    <ol class="rules-list">
+      <li>不同分钟：按分钟时间先后。</li>
+      <li>同表同分钟：按 CSV 行序。</li>
+      <li>跨表同分钟：默认先后未知，可补记两条跨表记录的确知顺序。</li>
+      <li>交运前必须至少有一次<strong>验封通过</strong>。</li>
+      <li>最后一次通过到交运之间，不能出现<strong>换签</strong>或<strong>验封失败</strong>。</li>
+    </ol>
+    <div class="note">
+      由于流水只有四类动作，若存在合格排列，可构造为“某次验封通过后紧接交运”；
+      若存在不合格排列，则可构造为“换签/验封失败后紧接交运”或交运在最前。
+      系统使用偏序可达性和位集计算，不穷举同分钟排列。
+    </div>
+    <h3>CSV 示例</h3>
+    <pre class="code">记录号,分钟时间,动作
+W-101,2026-11-24 10:00,换签
+W-102,2026-11-24 10:05,交运</pre>
+    <pre class="code">记录号,分钟时间,动作
+Q-201,2026-11-24 10:04,验封通过</pre>
+  </section>
+</div>
+
+<section class="card recent-card">
+  <div class="card-head">
+    <h2>SQLite 中最近的核查箱</h2>
+    <a class="btn btn-ghost" href="{{ url_for('list_cases_api') }}">JSON 列表</a>
+  </div>
+  {% if cases %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>箱号</th>
+          <th>结论</th>
+          <th>流水数</th>
+          <th>补记数</th>
+          <th>创建时间 (UTC)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in cases %}
+        <tr>
+          <td><a href="{{ url_for('case_detail', case_id=item.id) }}"><strong>{{ item.box_code }}</strong></a></td>
+          <td>
+            {% if item.current_verdict == 'always_compliant' %}
+              <span class="verdict-pill verdict-good">必然合格</span>
+            {% elif item.current_verdict == 'always_noncompliant' %}
+              <span class="verdict-pill verdict-bad">必然不合格</span>
+            {% elif item.current_verdict == 'ambiguous' %}
+              <span class="verdict-pill verdict-warn">两者都有可能</span>
+            {% else %}
+              <span class="verdict-pill">{{ item.current_verdict or '未判定' }}</span>
+            {% endif %}
+          </td>
+          <td>{{ item.record_count }}</td>
+          <td>{{ item.supplement_count }}</td>
+          <td class="mono">{{ item.created_at }}</td>
+          <td><a class="btn btn-small" href="{{ url_for('case_detail', case_id=item.id) }}">打开</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">尚未保存核查案例。上传两份 CSV 后，流水、补记和结论会写入 SQLite。</p>
+  {% endif %}
+</section>
+{% endblock %}

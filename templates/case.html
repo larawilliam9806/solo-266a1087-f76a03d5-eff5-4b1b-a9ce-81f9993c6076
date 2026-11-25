@@ -1,0 +1,239 @@
+{% extends "base.html" %}
+{% block title %}{{ case.box_code }} · 核查结论{% endblock %}
+{% block content %}
+<div class="case-header">
+  <div>
+    <p class="eyebrow">CASE {{ case.id[:12] }}</p>
+    <h1>{{ case.box_code }}</h1>
+    <p class="muted">
+      库房文件：{{ case.warehouse_filename or '—' }} ·
+      质检文件：{{ case.qc_filename or '—' }} ·
+      创建于 {{ case.created_at }} UTC
+    </p>
+  </div>
+  <div class="header-actions">
+    <a class="btn" href="{{ url_for('index') }}">上传新箱</a>
+    <a class="btn btn-ghost" href="{{ url_for('case_detail_api', case_id=case.id) }}">JSON</a>
+  </div>
+</div>
+
+{% if added %}
+<div class="alert alert-success" role="status" data-testid="supplement-saved">
+  补记已保存，系统已重新判定并写入新结论。
+</div>
+{% endif %}
+{% if error_message %}
+<div class="alert alert-error" role="alert" data-testid="conflict-message" data-conflict="{{ 'true' if conflict else 'false' }}">
+  <strong>补记被退回：</strong>{{ error_message }}
+  <div>已有补记和当前结论均保持不变。</div>
+</div>
+{% endif %}
+
+{% if conclusion %}
+<section
+  id="verdict"
+  class="verdict-banner verdict-{{ conclusion.verdict }}"
+  data-verdict="{{ conclusion.verdict }}"
+  data-compliant-possible="{{ conclusion.compliant_possible | lower }}"
+  data-noncompliant-possible="{{ conclusion.noncompliant_possible | lower }}"
+>
+  <div>
+    <p class="eyebrow">当前判定</p>
+    <h2>{{ conclusion.verdict_text }}</h2>
+    {% if conclusion.verdict == 'ambiguous' %}
+      <p>跨表同分钟的先后仍有未知空间；下面分别给出一条可行的合格顺序和一条可行的不合格顺序。</p>
+    {% elif conclusion.verdict == 'always_compliant' %}
+      <p>在所有符合分钟、行序和已有补记的排列中，交运前都存在一次之后无换签/失败的验封通过。</p>
+    {% else %}
+      <p>在所有符合分钟、行序和已有补记的排列中，最后一次验封通过后、交运前都仍会出现换签或验封失败，或交运前根本无通过。</p>
+    {% endif %}
+  </div>
+  <div class="verdict-stats">
+    <div><strong>{{ conclusion.record_count }}</strong><span>流水记录</span></div>
+    <div><strong>{{ supplements | length }}</strong><span>已存补记</span></div>
+  </div>
+</section>
+
+<section class="orders-grid {% if conclusion.verdict == 'ambiguous' %}two{% else %}one{% endif %}">
+  <article class="card order-panel order-good" id="compliant-order-panel" data-possible="{{ conclusion.compliant_possible | lower }}">
+    <div class="card-head">
+      <h3>可行的合格记录号顺序</h3>
+      {% if conclusion.compliant_possible %}
+        <span class="verdict-pill verdict-good">存在</span>
+      {% else %}
+        <span class="verdict-pill verdict-muted">不存在</span>
+      {% endif %}
+    </div>
+    {% if conclusion.compliant_order_items %}
+      <ol class="order-chain" id="compliant-order" data-testid="compliant-order">
+        {% for record in conclusion.compliant_order_items %}
+        <li class="order-node kind-{{ record.kind }}" data-uid="{{ record.uid }}" data-record-no="{{ record.record_no }}">
+          <span class="order-index">{{ loop.index }}</span>
+          <span class="order-record-no">{{ record.record_no }}</span>
+          <span class="order-sub">
+            <span class="table-badge {{ record.table }}">{{ table_label(record.table) }}</span>
+            {{ record.minute_text }} · {{ action_label(record.kind) }}
+          </span>
+        </li>
+        {% endfor %}
+      </ol>
+      <p class="record-number-line" data-testid="compliant-record-number-line">
+        {{ conclusion.compliant_order_record_numbers | join(' → ') }}
+      </p>
+    {% else %}
+      <p class="empty">加入任何符合约束的补记后，都无法构造合格顺序。</p>
+    {% endif %}
+  </article>
+
+  <article class="card order-panel order-bad" id="noncompliant-order-panel" data-possible="{{ conclusion.noncompliant_possible | lower }}">
+    <div class="card-head">
+      <h3>可行的不合格记录号顺序</h3>
+      {% if conclusion.noncompliant_possible %}
+        <span class="verdict-pill verdict-bad">存在</span>
+      {% else %}
+        <span class="verdict-pill verdict-muted">不存在</span>
+      {% endif %}
+    </div>
+    {% if conclusion.noncompliant_order_items %}
+      <ol class="order-chain" id="noncompliant-order" data-testid="noncompliant-order">
+        {% for record in conclusion.noncompliant_order_items %}
+        <li class="order-node kind-{{ record.kind }}" data-uid="{{ record.uid }}" data-record-no="{{ record.record_no }}">
+          <span class="order-index">{{ loop.index }}</span>
+          <span class="order-record-no">{{ record.record_no }}</span>
+          <span class="order-sub">
+            <span class="table-badge {{ record.table }}">{{ table_label(record.table) }}</span>
+            {{ record.minute_text }} · {{ action_label(record.kind) }}
+          </span>
+        </li>
+        {% endfor %}
+      </ol>
+      <p class="record-number-line" data-testid="noncompliant-record-number-line">
+        {{ conclusion.noncompliant_order_record_numbers | join(' → ') }}
+      </p>
+    {% else %}
+      <p class="empty">所有符合约束的排列都会合格，无法构造不合格顺序。</p>
+    {% endif %}
+  </article>
+</section>
+{% endif %}
+
+<section class="card supplement-card" id="supplement-form-card">
+  <div class="card-head">
+    <h2>补记跨表先后并重判</h2>
+    <span class="pill">冲突会退回，不覆盖已有数据</span>
+  </div>
+  <form method="post" action="{{ url_for('add_supplement_html', case_id=case.id) }}" id="supplement-form" class="supplement-form">
+    <div class="supplement-selects">
+      <div class="field">
+        <label for="warehouse_uid"><span class="table-badge warehouse">库房</span>记录</label>
+        <select id="warehouse_uid" name="warehouse_uid" required data-testid="warehouse-select">
+          <option value="">请选择库房记录</option>
+          {% for record in records | selectattr('table_name', 'equalto', 'warehouse') %}
+          <option value="{{ record.uid }}" {% if request.form.get('warehouse_uid') == record.uid %}selected{% endif %}>
+            {{ record.record_no }}｜{{ record.minute_text }}｜{{ action_label(record.kind) }}｜第{{ record.row_no }}行
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="direction-box">
+        <label class="radio-line">
+          <input type="radio" name="direction" value="w_before_q" checked>
+          <span>库房记录 <strong>早于</strong> 质检记录</span>
+        </label>
+        <label class="radio-line">
+          <input type="radio" name="direction" value="q_before_w">
+          <span>质检记录 <strong>早于</strong> 库房记录</span>
+        </label>
+      </div>
+
+      <div class="field">
+        <label for="qc_uid"><span class="table-badge qc">质检</span>记录</label>
+        <select id="qc_uid" name="qc_uid" required data-testid="qc-select">
+          <option value="">请选择质检记录</option>
+          {% for record in records | selectattr('table_name', 'equalto', 'qc') %}
+          <option value="{{ record.uid }}" {% if request.form.get('qc_uid') == record.uid %}selected{% endif %}>
+            {{ record.record_no }}｜{{ record.minute_text }}｜{{ action_label(record.kind) }}｜第{{ record.row_no }}行
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <button class="btn btn-primary" type="submit" data-testid="add-supplement">补记并重新判定</button>
+  </form>
+
+  <div class="supplement-list">
+    <h3>已有补记（{{ supplements | length }}）</h3>
+    {% if supplements %}
+    <ul id="supplements" data-testid="supplement-list">
+      {% for item in supplements %}
+      <li class="supplement-item" data-before="{{ item.before_uid }}" data-after="{{ item.after_uid }}">
+        <span class="table-badge {{ item.before_table }}">{{ table_label(item.before_table) }}</span>
+        <strong>{{ item.before_record_no }}</strong>
+        <span class="arrow-text">早于 →</span>
+        <span class="table-badge {{ item.after_table }}">{{ table_label(item.after_table) }}</span>
+        <strong>{{ item.after_record_no }}</strong>
+        <time class="muted">{{ item.created_at }}</time>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty" id="no-supplements">暂无补记；跨表同分钟记录默认先后未知。</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="ledgers-grid">
+  {% for table_name, table_title in [('warehouse', '库房流水'), ('qc', '质检流水')] %}
+  <article class="card ledger-card">
+    <div class="card-head">
+      <h2>{{ table_title }}</h2>
+      <span class="table-badge {{ table_name }}">{{ table_label(table_name) }}</span>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table ledger-table">
+        <thead>
+          <tr><th>行序</th><th>记录号</th><th>分钟</th><th>动作</th></tr>
+        </thead>
+        <tbody>
+          {% for record in records | selectattr('table_name', 'equalto', table_name) %}
+          <tr class="kind-row-{{ record.kind }}">
+            <td class="mono">{{ record.row_no }}</td>
+            <td class="mono"><strong>{{ record.record_no }}</strong></td>
+            <td class="mono">{{ record.minute_text }}</td>
+            <td><span class="kind-dot kind-{{ record.kind }}"></span>{{ action_label(record.kind) }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="empty">该表无记录</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </article>
+  {% endfor %}
+</section>
+
+<section class="card history-card">
+  <h2>结论历史</h2>
+  {% if history %}
+  <ol class="history-list">
+    {% for item in history %}
+    <li>
+      <span class="mono">#{{ item.id }}</span>
+      {% if item.verdict == 'always_compliant' %}
+        <span class="verdict-pill verdict-good">必然合格</span>
+      {% elif item.verdict == 'always_noncompliant' %}
+        <span class="verdict-pill verdict-bad">必然不合格</span>
+      {% else %}
+        <span class="verdict-pill verdict-warn">两者都有可能</span>
+      {% endif %}
+      <span class="pill">{{ '初次上传' if item.trigger_type == 'initial' else '补记重判' }}</span>
+      <time class="muted">{{ item.created_at }} UTC</time>
+    </li>
+    {% endfor %}
+  </ol>
+  {% else %}
+  <p class="empty">暂无结论历史。</p>
+  {% endif %}
+</section>
+{% endblock %}
