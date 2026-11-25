@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}{{ case.box_code }} · 按号查阅{% endblock %}
+
+{% macro order_panel(result_order, kind_key, title, absent_text) %}
+{% set possible = result_order and result_order.exists %}
+<article class="card order-panel lookup-order-panel {{ 'order-good' if kind_key == 'compliant' else 'order-bad' }}"
+         id="{{ kind_key }}-lookup-panel" data-possible="{{ 'true' if possible else 'false' }}"
+         data-testid="{{ kind_key }}-lookup-panel">
+  <div class="card-head">
+    <h3>{{ title }}</h3>
+    {% if possible %}
+      <span class="verdict-pill {{ 'verdict-good' if kind_key == 'compliant' else 'verdict-bad' }}">存在</span>
+    {% else %}
+      <span class="verdict-pill verdict-muted">不存在</span>
+    {% endif %}
+  </div>
+
+  {% if not possible %}
+    <p class="empty" data-testid="{{ kind_key }}-absent">{{ absent_text }}</p>
+  {% else %}
+    <div class="lookup-meta" data-testid="{{ kind_key }}-meta">
+      <span>本记录序号：<strong data-testid="{{ kind_key }}-position">第 {{ result_order.position }} 号</strong> / 共 {{ result_order.total }} 条</span>
+      <span>
+        与交运的先后：
+        {% if result_order.shipment_position is none %}
+          <strong>未知</strong>
+        {% elif result_order.position < result_order.shipment_position %}
+          <strong class="verdict-good">早于交运 {{ result_order.shipment_position - result_order.position }} 位</strong>（交运在第 {{ result_order.shipment_position }} 号）
+        {% elif result_order.position > result_order.shipment_position %}
+          <strong class="verdict-bad">晚于交运 {{ result_order.position - result_order.shipment_position }} 位</strong>（交运在第 {{ result_order.shipment_position }} 号）
+        {% else %}
+          <strong>本记录即交运</strong>（第 {{ result_order.shipment_position }} 号）
+        {% endif %}
+      </span>
+    </div>
+
+    <ol class="order-chain lookup-chain" data-testid="{{ kind_key }}-window">
+      {% if result_order.has_before_gap %}
+      <li class="order-gap">… 前面还有 {{ result_order.window_start - 1 }} 条 …</li>
+      {% endif %}
+      {% for item in result_order.window %}
+      <li class="order-node kind-{{ item.kind }} {{ 'is-target' if item.is_target }}"
+          data-uid="{{ item.uid }}" data-record-no="{{ item.record_no }}"
+          {% if item.is_target %}data-testid="{{ kind_key }}-target"{% endif %}>
+        <span class="order-index">{{ item.position }}</span>
+        <span class="order-record-no">{{ item.record_no }}{% if item.is_target %} ◂ 纸质凭据记录{% endif %}</span>
+        <span class="order-sub">
+          <span class="table-badge {{ item.table_name }}">{{ table_label(item.table_name) }}</span>
+          {{ item.minute_text }} · {{ action_label(item.kind) }}
+        </span>
+      </li>
+      {% endfor %}
+      {% if result_order.has_after_gap %}
+      <li class="order-gap">… 后面还有 {{ result_order.total - result_order.window_end }} 条 …</li>
+      {% endif %}
+    </ol>
+  {% endif %}
+</article>
+{% endmacro %}
+
+{% block content %}
+<div class="case-header">
+  <div>
+    <p class="eyebrow">LOOKUP CASE {{ case.id[:12] }} · 结论 #{{ conclusion.id }}</p>
+    <h1>{{ case.box_code }} · 按号查阅</h1>
+    <p class="muted">
+      本页固定使用结论 #{{ conclusion.id }}（{{ conclusion.verdict }}）；
+      {% if is_latest %}当前为最新结论。{% else %}
+      此结论生成于补记重判之前，页面仍按原结论定位；
+      <a href="{{ url_for('record_lookup', case_id=case.id) }}">打开最新结论的查阅页</a>。
+      {% endif %}
+      完整可行顺序请在<a href="{{ url_for('case_detail', case_id=case.id) }}">案例详情</a>查看。
+    </p>
+  </div>
+  <div class="header-actions">
+    <a class="btn" href="{{ url_for('case_detail', case_id=case.id) }}">案例详情（完整顺序）</a>
+    <a class="btn btn-ghost" href="{{ url_for('index') }}">案例列表</a>
+  </div>
+</div>
+
+{% if index_status == 'failed' %}
+<div class="alert alert-error" role="alert" data-testid="index-failed">
+  <strong>旧结论的顺序索引整理失败：</strong>{{ index_error or '未知错误' }}
+  <div>定位功能暂不可用。可重试整理一次；仍失败时请联系管理员。</div>
+  <form method="post" action="{{ url_for('retry_reindex_html', case_id=case.id) }}" class="inline-form">
+    <input type="hidden" name="conclusion_id" value="{{ conclusion.id }}">
+    <button class="btn btn-primary btn-small" type="submit" data-testid="retry-reindex">重试整理</button>
+  </form>
+</div>
+{% elif index_status == 'pending' %}
+<div class="alert" role="status" data-testid="index-pending">
+  正在整理旧结论的顺序索引，请稍后重试查询。
+</div>
+{% endif %}
+{% if request.args.get('reindex_failed') == '1' %}
+<div class="alert alert-error" role="alert" data-testid="reindex-failed-message">
+  <strong>重试整理仍未成功，请稍后再试。</strong>
+</div>
+{% endif %}
+{% if form_error %}
+<div class="alert alert-error" role="alert" data-testid="lookup-error">
+  <strong>无法定位：</strong>{{ form_error }}
+</div>
+{% endif %}
+
+<section class="card lookup-form-card">
+  <div class="card-head">
+    <h2>按纸质凭据记录号查阅</h2>
+    <span class="pill">只取该记录及其前后各至多三条，不加载整条顺序</span>
+  </div>
+  <form method="get" action="{{ url_for('record_lookup', case_id=case.id) }}" id="lookup-form" class="supplement-form">
+    <input type="hidden" name="conclusion_id" value="{{ conclusion.id }}">
+    <div class="supplement-selects">
+      <div class="field">
+        <label>凭据来源</label>
+        <div class="direction-box">
+          <label class="radio-line">
+            <input type="radio" name="table" value="warehouse"
+                   {% if form_table == 'warehouse' or not form_table %}checked{% endif %}
+                   data-testid="table-warehouse">
+            <span class="table-badge warehouse">库房</span>
+          </label>
+          <label class="radio-line">
+            <input type="radio" name="table" value="qc"
+                   {% if form_table == 'qc' %}checked{% endif %}
+                   data-testid="table-qc">
+            <span class="table-badge qc">质检</span>
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <label for="record_no">纸质凭据上的记录号</label>
+        <input id="record_no" name="record_no" type="text" required
+               value="{{ form_record_no }}" placeholder="例如 W-002"
+               data-testid="record-no-input" autocomplete="off">
+      </div>
+    </div>
+    <button class="btn btn-primary" type="submit" data-testid="lookup-submit"
+            {% if index_status != 'ready' %}disabled title="顺序索引尚未就绪"{% endif %}>
+      定位查阅
+    </button>
+  </form>
+</section>
+
+{% if result %}
+<section class="lookup-summary" data-testid="lookup-summary">
+  <p>
+    记录 <strong>{{ result.target.record_no }}</strong>
+    （<span class="table-badge {{ result.table_name }}">{{ table_label(result.table_name) }}</span>
+    {{ result.target.minute_text }} · {{ action_label(result.target.kind) }}）
+    在固定结论 #{{ result.conclusion_id }}（{{ result.verdict_text }}）中的位置：
+  </p>
+</section>
+
+<section class="orders-grid two">
+  {{ order_panel(result.orders.compliant, 'compliant', '合格顺序中的位置', '该结论下不存在可行的合格顺序。') }}
+  {{ order_panel(result.orders.noncompliant, 'noncompliant', '不合格顺序中的位置', '该结论下不存在可行的不合格顺序。') }}
+</section>
+{% endif %}
+{% endblock %}

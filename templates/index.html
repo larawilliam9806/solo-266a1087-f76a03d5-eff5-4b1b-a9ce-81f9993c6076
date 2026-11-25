@@ -108,7 +108,10 @@ Q-201,2026-11-24 10:04,验封通过</pre>
           <td>{{ item.record_count }}</td>
           <td>{{ item.supplement_count }}</td>
           <td class="mono">{{ item.created_at }}</td>
-          <td><a class="btn btn-small" href="{{ url_for('case_detail', case_id=item.id) }}">打开</a></td>
+          <td class="row-actions">
+            <a class="btn btn-small" href="{{ url_for('case_detail', case_id=item.id) }}">打开</a>
+            <a class="btn btn-small btn-ghost" href="{{ url_for('record_lookup', case_id=item.id) }}" data-testid="lookup-link">按号查阅</a>
+          </td>
         </tr>
         {% endfor %}
       </tbody>

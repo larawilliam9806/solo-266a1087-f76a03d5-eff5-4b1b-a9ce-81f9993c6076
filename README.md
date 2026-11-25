@@ -8,6 +8,32 @@
 
 支持在页面上补记一条**跨表记录先后关系**后重新判定。补记与分钟、行序或已有补记冲突时返回 `409`/页面错误，不写入冲突补记，原有补记和当前结论保持不变。
 
+## 按号查阅（长流水点查，不整条加载）
+
+登记员从案例列表或案例详情点击**按号查阅**，选择凭据来源（库房/质检）并输入纸质凭据上的记录号，页面在同一屏对照该流水：
+
+- 在**可行合格顺序**与**可行不合格顺序**中的序号（第 N 号 / 共 M 条）；
+- 与**交运**的先后（早于/晚于几位，或本记录即交运）；
+- 该顺序中其**前后各至多三条**流水，超出部分以省略标记提示，不翻取整条顺序；
+- 某种顺序在当前结论下不存在时，对应面板明确标注“不存在”。
+
+实现上，每条结论在落库时同步写入 `order_indexes` 槽位索引（结论 + 顺序 + 序号 → UID）。**打开查阅页只读案例/结论元数据，不读任何顺序槽位、不读结论载荷、不读原始 CSV；定位一次只做点查询和最多 7 个槽位的区间查询**，不会通读整条顺序或预载整份流水。完整可行顺序仍在原案例详情页查看。
+
+### 结论快照与补记重判
+
+- 查阅页通过 `conclusion_id` **固定**到打开时的结论。补记重判后，已打开（已固定）的查阅页仍按原结论定位；新打开的查阅页自动使用最新结论，并在旧快照页提供“打开最新结论的查阅页”入口。
+- 新版本写入的结论在同一事务内即时建好索引（`index_status=ready`）。
+- 旧版本遗留结论首次被查阅时，**至多整理一次**顺序索引；整理失败会记录原因，页面提示并提供“重试整理”，定位接口在索引就绪前返回 `409 retryable`，绝不静默退化为整条扫描。
+
+### 查阅接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/cases/<id>/lookup` | 查阅页（HTML），可带 `conclusion_id` 固定快照；带 `table`、`record_no` 时同页定位 |
+| GET | `/api/cases/<id>/lookup?table=warehouse\|qc&record_no=...&conclusion_id=...` | 点查 JSON，窗口 ≤7 条；记录号不存在返回 400，索引未就绪返回 409 |
+| POST | `/cases/<id>/lookup/reindex` | 失败后重试整理旧结论（表单，303 回查阅页） |
+| POST | `/api/cases/<id>/lookup/reindex` | 同上的 JSON 版本 |
+
 ## 启动
 
 ```bash
@@ -142,7 +168,8 @@ curl -i -X POST "http://localhost:5000/api/cases/$CID/supplements" \
 - `cases`：箱号、原始 CSV 文本、当前结论指针；
 - `records`：解析后的流水、表别、记录号、分钟键、行序、动作类型；
 - `supplements`：已接受的跨表先后补记；
-- `conclusions`：初次上传及每次成功补记后的结论 JSON 历史。
+- `conclusions`：初次上传及每次成功补记后的结论 JSON 历史，并带 `index_status`（`ready`/`pending`/`failed`）与 `index_error`；
+- `order_indexes`：每条结论两条见证顺序的槽位索引（结论 + 顺序种类 + 序号 ↔ UID），支撑按号点查，使查阅无需加载整条顺序。旧库启动时自动补列，遗留结论在首次查阅时懒整理。
 
 ## 测试
 
@@ -150,18 +177,20 @@ curl -i -X POST "http://localhost:5000/api/cases/$CID/supplements" \
 python tests/test_algorithm_exhaustive.py   # 与全排列暴力判定随机对照
 python tests/test_performance.py            # 320 条同分钟记录性能检查
 python tests/test_app.py                    # Flask/SQLite/冲突退回测试（需安装 Flask）
+python tests/test_lookup.py                 # 按号查阅：窗口截断、结论快照、旧结论懒整理/重试、SQL 边界（需安装 Flask）
 ```
 
 ## 目录
 
 ```text
-app.py          Flask 路由、上传、持久化与页面/API
+app.py          Flask 路由、上传、持久化、按号查阅页面/API
+order_index.py  见证顺序槽位索引、懒整理/重试、有界窗口点查
 verifier.py     CSV 解析、偏序、可达性、三态判定和见证顺序
-database.py     SQLite schema/连接辅助
-templates/      服务端渲染页面
+database.py     SQLite schema/连接辅助（含旧库自动迁移）
+templates/      服务端渲染页面（lookup.html 为按号查阅页）
 static/style.css
 samples/        一组可直接上传的歧义样例
-tests/          算法、性能和接口测试
+tests/          算法、性能、接口和查阅点查测试
 Dockerfile
 compose.yaml
 docker-compose.yml

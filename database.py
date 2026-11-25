@@ -100,13 +100,47 @@ def init_db() -> None:
             noncompliant_possible INTEGER NOT NULL,
             payload_json TEXT NOT NULL,
             trigger_type TEXT NOT NULL DEFAULT 'supplement',
+            index_status TEXT NOT NULL DEFAULT 'ready',
+            index_error TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(case_id) REFERENCES cases(id) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_conclusions_case ON conclusions(case_id);
+
+        -- Point-lookup index for the record-number lookup page.  Each row is
+        -- one slot of one witness order, so a lookup never scans the whole
+        -- order; it reads only the target slot plus at most three on each side.
+        CREATE TABLE IF NOT EXISTS order_indexes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conclusion_id INTEGER NOT NULL,
+            order_kind TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            uid TEXT NOT NULL,
+            UNIQUE(conclusion_id, order_kind, position),
+            UNIQUE(conclusion_id, order_kind, uid),
+            FOREIGN KEY(conclusion_id) REFERENCES conclusions(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_order_indexes_lookup
+            ON order_indexes(conclusion_id, order_kind, position);
+        CREATE INDEX IF NOT EXISTS idx_order_indexes_uid
+            ON order_indexes(conclusion_id, order_kind, uid);
         """
     )
+    # Databases created before the lookup feature lack the index_status
+    # column.  Legacy conclusions are materialised lazily on first lookup.
+    columns = {
+        row["name"]
+        for row in db.execute("PRAGMA table_info(conclusions)").fetchall()
+    }
+    if "index_status" not in columns:
+        db.execute(
+            "ALTER TABLE conclusions ADD COLUMN index_status TEXT "
+            "NOT NULL DEFAULT 'pending'"
+        )
+    if "index_error" not in columns:
+        db.execute("ALTER TABLE conclusions ADD COLUMN index_error TEXT")
     db.commit()
 
 

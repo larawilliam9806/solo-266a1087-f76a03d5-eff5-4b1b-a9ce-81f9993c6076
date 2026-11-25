@@ -12,6 +12,7 @@
     </p>
   </div>
   <div class="header-actions">
+    <a class="btn btn-primary" href="{{ url_for('record_lookup', case_id=case.id) }}" data-testid="case-lookup-link">按号查阅</a>
     <a class="btn" href="{{ url_for('index') }}">上传新箱</a>
     <a class="btn btn-ghost" href="{{ url_for('case_detail_api', case_id=case.id) }}">JSON</a>
   </div>

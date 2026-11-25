@@ -18,11 +18,23 @@ from flask import (
 )
 
 from database import close_db, get_db, init_db, loads_conclusion, now_iso
+from order_index import (
+    STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_READY,
+    OrderIndexError,
+    build_lookup,
+    ensure_indexed,
+    get_index_status,
+    index_new_conclusion,
+    retry_materialization,
+)
 from verifier import (
     TABLE_QC,
     TABLE_WAREHOUSE,
     ConflictError,
     VerificationError,
+    VERDICT_TEXT,
     action_label,
     analyze,
     decode_raw,
@@ -95,6 +107,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app.jinja_env.globals["table_label"] = table_label
 
     app.teardown_appcontext(close_db)
+
+    @app.errorhandler(OrderIndexError)
+    def handle_order_index_error(exc):
+        if request.path.startswith("/api/"):
+            return jsonify(error=str(exc), retryable=True), 409
+        return str(exc), 409
 
     with app.app_context():
         init_db()
@@ -208,8 +226,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 INSERT INTO conclusions (
                     case_id, verdict, compliant_possible,
                     noncompliant_possible, payload_json,
-                    trigger_type, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'initial', ?)
+                    trigger_type, index_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'initial', 'ready', ?)
                 """,
                 (
                     case_id,
@@ -220,6 +238,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     created_at,
                 ),
             )
+            # Eager index: the conclusion is still in memory, so no full order
+            # is ever re-read to support point lookups.
+            index_new_conclusion(db, conclusion_cursor.lastrowid, conclusion)
             db.execute(
                 "UPDATE cases SET current_conclusion_id = ? WHERE id = ?",
                 (conclusion_cursor.lastrowid, case_id),
@@ -487,8 +508,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 INSERT INTO conclusions (
                     case_id, verdict, compliant_possible,
                     noncompliant_possible, payload_json,
-                    trigger_type, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'supplement', ?)
+                    trigger_type, index_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'supplement', 'ready', ?)
                 """,
                 (
                     case_id,
@@ -499,6 +520,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     created_at,
                 ),
             )
+            index_new_conclusion(db, conclusion_cursor.lastrowid, conclusion)
             db.execute(
                 "UPDATE cases SET current_verdict = ?, current_conclusion_id = ? WHERE id = ?",
                 (
@@ -512,6 +534,132 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             db.rollback()
             raise
         return get_detail(case_id), False
+
+    # Lightweight columns only: the lookup page must never pull the raw CSVs
+    # (whole ledgers) or the conclusion payload (full orders) into memory.
+    CASE_LOOKUP_COLUMNS = (
+        "id, box_code, warehouse_filename, qc_filename, "
+        "current_verdict, current_conclusion_id, created_at"
+    )
+    CONCLUSION_LOOKUP_COLUMNS = (
+        "id, case_id, verdict, compliant_possible, "
+        "noncompliant_possible, trigger_type, index_status, "
+        "index_error, created_at"
+    )
+
+    def get_case_row(case_id: str):
+        return get_db().execute(
+            f"SELECT {CASE_LOOKUP_COLUMNS} FROM cases WHERE id = ?",
+            (case_id,),
+        ).fetchone()
+
+    def get_pinned_conclusion(case_id: str, conclusion_id: int | None):
+        """Resolve the conclusion a lookup page is pinned to.
+
+        A page opened before a supplement keeps its own conclusion id and must
+        keep using that snapshot; it never silently switches to the latest one.
+        Only the full-order case detail page shows the current conclusion.
+        The payload_json column (full witness orders) is deliberately excluded.
+        """
+        db = get_db()
+        if conclusion_id is None:
+            case_row = get_case_row(case_id)
+            conclusion_id = (
+                case_row["current_conclusion_id"] if case_row else None
+            )
+        if conclusion_id is None:
+            row = db.execute(
+                f"SELECT {CONCLUSION_LOOKUP_COLUMNS} FROM conclusions "
+                "WHERE case_id = ? ORDER BY id DESC LIMIT 1",
+                (case_id,),
+            ).fetchone()
+        else:
+            row = db.execute(
+                f"SELECT {CONCLUSION_LOOKUP_COLUMNS} FROM conclusions "
+                "WHERE id = ? AND case_id = ?",
+                (conclusion_id, case_id),
+            ).fetchone()
+        return row
+
+    def lookup_form_input():
+        data = request.args if request.method == "GET" else request.form
+        table_name = (data.get("table") or data.get("table_name") or "").strip()
+        if table_name in ("W", "w", "warehouse", "库房", "W::"):
+            table_name = TABLE_WAREHOUSE
+        elif table_name in ("Q", "q", "qc", "质检", "Q::"):
+            table_name = TABLE_QC
+        record_no = (data.get("record_no") or data.get("record") or "").strip()
+        raw_conclusion_id = data.get("conclusion_id")
+        try:
+            conclusion_id = int(raw_conclusion_id) if raw_conclusion_id else None
+        except (TypeError, ValueError):
+            raise VerificationError("结论编号无效")
+        return table_name, record_no, conclusion_id
+
+    def lookup_page_context(case_id: str, conclusion_id: int | None):
+        """Data needed to render the lookup page itself.
+
+        Intentionally excludes the whole ledger and the full order payload:
+        only case/conclusion metadata is required until a record is located.
+        """
+        case_row = get_case_row(case_id)
+        if case_row is None:
+            return None
+        case = dict(case_row)
+        conclusion_row = get_pinned_conclusion(case_id, conclusion_id)
+        if conclusion_row is None:
+            abort(404)
+        conclusion = dict(conclusion_row)
+        db = get_db()
+        status = get_index_status(db, conclusion_row["id"])
+        index_error = None
+        if status == STATUS_PENDING:
+            # Legacy conclusion: one-time materialisation on first lookup.
+            status = ensure_indexed(db, conclusion_row["id"])
+        if status == STATUS_FAILED:
+            error_row = db.execute(
+                "SELECT index_error FROM conclusions WHERE id = ?",
+                (conclusion_row["id"],),
+            ).fetchone()
+            index_error = error_row["index_error"] if error_row else None
+        latest_row = db.execute(
+            "SELECT id FROM conclusions WHERE case_id = ? ORDER BY id DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        latest_id = latest_row["id"] if latest_row else None
+        return {
+            "case": case,
+            "conclusion": conclusion,
+            "index_status": status,
+            "index_error": index_error,
+            "is_latest": latest_id == conclusion_row["id"],
+        }
+
+    def locate_service(case_id: str):
+        case_row = get_case_row(case_id)
+        if case_row is None:
+            abort(404)
+        table_name, record_no, conclusion_id = lookup_form_input()
+        if table_name not in (TABLE_WAREHOUSE, TABLE_QC):
+            raise VerificationError("请选择库房或质检")
+        if not record_no:
+            raise VerificationError("请输入纸质凭据上的记录号")
+        conclusion_row = get_pinned_conclusion(case_id, conclusion_id)
+        if conclusion_row is None:
+            abort(404)
+        status = ensure_indexed(get_db(), conclusion_row["id"])
+        if status != STATUS_READY:
+            raise OrderIndexError(
+                "旧结论的顺序索引尚未整理完成，请在查阅页点击“重试整理”后再定位"
+            )
+        result = build_lookup(
+            get_db(), case_id, conclusion_row["id"], table_name, record_no
+        )
+        result["verdict"] = conclusion_row["verdict"]
+        result["verdict_text"] = VERDICT_TEXT.get(
+            conclusion_row["verdict"], conclusion_row["verdict"]
+        )
+        return result, conclusion_row["id"]
 
     @app.get("/health")
     def health():
@@ -557,6 +705,80 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             conflict=False,
             added=added,
         )
+
+    @app.get("/cases/<case_id>/lookup")
+    def record_lookup(case_id: str):
+        context = lookup_page_context(
+            case_id, request.args.get("conclusion_id", type=int)
+        )
+        if context is None:
+            abort(404)
+        result = None
+        form_error = None
+        table_name = request.args.get("table", "")
+        record_no = request.args.get("record_no", "")
+        # Only run the point lookup when the operator actually submitted a
+        # record number; opening the page reads no order slots at all.
+        if record_no:
+            try:
+                result, _ = locate_service(case_id)
+            except OrderIndexError as exc:
+                form_error = str(exc)
+            except VerificationError as exc:
+                form_error = str(exc)
+        return render_template(
+            "lookup.html",
+            **context,
+            result=result,
+            form_error=form_error,
+            form_table=table_name,
+            form_record_no=record_no,
+        )
+
+    @app.get("/api/cases/<case_id>/lookup")
+    def record_lookup_api(case_id: str):
+        if not case_exists(case_id):
+            return jsonify(error="案例不存在"), 404
+        try:
+            result, _ = locate_service(case_id)
+        except VerificationError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(result)
+
+    @app.post("/cases/<case_id>/lookup/reindex")
+    def retry_reindex_html(case_id: str):
+        if not case_exists(case_id):
+            abort(404)
+        conclusion_id = request.form.get("conclusion_id", type=int)
+        conclusion_row = get_pinned_conclusion(case_id, conclusion_id)
+        if conclusion_row is None:
+            abort(404)
+        status = retry_materialization(get_db(), conclusion_row["id"])
+        target = url_for(
+            "record_lookup",
+            case_id=case_id,
+            conclusion_id=conclusion_row["id"],
+        )
+        if status != STATUS_READY:
+            target += "&reindex_failed=1" if "?" in target else "?reindex_failed=1"
+        return redirect(target, code=303)
+
+    @app.post("/api/cases/<case_id>/lookup/reindex")
+    def retry_reindex_api(case_id: str):
+        if not case_exists(case_id):
+            return jsonify(error="案例不存在"), 404
+        data = request.get_json(silent=True) or {}
+        try:
+            conclusion_id = int(data.get("conclusion_id"))
+        except (TypeError, ValueError):
+            return jsonify(error="结论编号无效"), 400
+        conclusion_row = get_pinned_conclusion(case_id, conclusion_id)
+        if conclusion_row is None:
+            return jsonify(error="结论不存在"), 404
+        status = retry_materialization(get_db(), conclusion_row["id"])
+        if status != STATUS_READY:
+            return jsonify(error="旧结论整理失败，请重试", retryable=True), 500
+        return jsonify(status=status, conclusion_id=conclusion_row["id"])
 
     @app.post("/cases/<case_id>/supplements")
     def add_supplement_html(case_id: str):
